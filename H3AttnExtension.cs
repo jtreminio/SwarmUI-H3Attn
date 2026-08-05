@@ -54,6 +54,8 @@ public class H3AttnExtension : Extension
             "xmarre"
         ));
         ScriptFiles.Add("assets/h3attn_install.js");
+        ScriptFiles.Add("assets/h3attn_preset.js");
+        ScriptFiles.Add("assets/h3attn_resolutions.js");
 
         H3AttnGroup = new T2IParamGroup(
             Name: "H3 Attention",
@@ -163,7 +165,7 @@ public class H3AttnExtension : Extension
 
         SolMortonCurve = T2IParamTypes.Register<string>(new T2IParamType(
             Name: "H3A Sol Morton Curve",
-            Description: "3d interleaves t/h/w equally. 2d_frame Z-orders within each frame and leaves frame order alone — H3's frame spacing is non-uniform, so prefer 2d_frame if 3d degrades at some frame counts.",
+            Description: "2d_frame Z-orders within each frame and leaves frame order alone — faster, but it can warp the video (a rippling, water-drop distortion) when a frame's token count is not a multiple of the kernel's 64-token block size, since the within-frame tiles then drift out of alignment with the routing blocks. Use the 32x Resolutions browser to pick a resolution where tokens-per-frame divides by 64. 3d interleaves t/h/w equally so each routing block is a compact space-time volume, which is immune to that drift.",
             Default: "2d_frame",
             GetValues: _ => ["3d", "2d_frame"],
             IsAdvanced: true,
