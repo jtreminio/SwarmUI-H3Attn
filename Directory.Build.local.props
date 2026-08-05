@@ -1,0 +1,6 @@
+<Project>
+  <PropertyGroup Condition="Exists('/tmp')">
+    <BaseOutputPath Condition="'$(BaseOutputPath)' == ''">/tmp/swarmui-msbuild/SwarmUI-H3Attn/bin/</BaseOutputPath>
+    <BaseIntermediateOutputPath Condition="'$(BaseIntermediateOutputPath)' == ''">/tmp/swarmui-msbuild/SwarmUI-H3Attn/obj/</BaseIntermediateOutputPath>
+  </PropertyGroup>
+</Project>
