@@ -7,9 +7,13 @@ const H3A_OPTIMAL_20 = {
     'H3A Sol End Percent': 0.9,
     'H3A Sol Min Tokens': 4096,
     'H3A Sol INT8 QK': true,
+    'H3A Sol INT8 PV': true,
     'H3A Sol Sink Conditioning': 'exact_kv_and_rows',
     'H3A Sol Morton': true,
     'H3A Sol Morton Curve': '2d_frame',
+    // Dense Blocks is deliberately absent — which blocks need to stay dense is per-model,
+    // and the only way to know is a Block Probe run. The preset leaves yours alone.
+    'H3A Sol Block Probe': false,
     'H3A Sol Use TMA': false,
     'H3A Sol Verbose': false,
     'H3A Spectrum Blend Weight': 0.5,

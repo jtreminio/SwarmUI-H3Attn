@@ -15,6 +15,7 @@ public class H3AttnExtension : Extension
 
     public const string SolFeatureFlag = "sol_attn_triton";
     public const string SolNodeName = "SolAttnPatch";
+    public const string SolProbeNodeName = "SolAttnBlockProbe";
 
     public const string SpectrumFeatureFlag = "spectrum_minimax_h3";
     public const string SpectrumNodeName = "SpectrumApplyMiniMaxH3";
@@ -27,8 +28,8 @@ public class H3AttnExtension : Extension
     // Sol-Attn (gate: SolTau — see IsSubGroupEnabled).
     public static T2IRegisteredParam<double> SolTau, SolStartPercent, SolEndPercent;
     public static T2IRegisteredParam<int> SolMinTokens;
-    public static T2IRegisteredParam<bool> SolInt8Qk, SolMorton, SolUseTma, SolVerbose;
-    public static T2IRegisteredParam<string> SolSinkConditioning, SolMortonCurve;
+    public static T2IRegisteredParam<bool> SolInt8Qk, SolInt8Pv, SolMorton, SolUseTma, SolBlockProbe, SolVerbose;
+    public static T2IRegisteredParam<string> SolSinkConditioning, SolMortonCurve, SolDenseBlocks;
 
     // Spectrum (gate: SpectrumBlendWeight).
     public static T2IRegisteredParam<double> SpectrumBlendWeight, SpectrumRidgeLambda, SpectrumWindowSize, SpectrumFlexWindow;
@@ -40,6 +41,7 @@ public class H3AttnExtension : Extension
     {
         Logs.Info("SwarmUI H3 Attn Extension initializing...");
         ComfyUIBackendExtension.NodeToFeatureMap[SolNodeName] = SolFeatureFlag;
+        ComfyUIBackendExtension.NodeToFeatureMap[SolProbeNodeName] = SolFeatureFlag;
         ComfyUIBackendExtension.NodeToFeatureMap[SpectrumNodeName] = SpectrumFeatureFlag;
         InstallableFeatures.RegisterInstallableFeature(new(
             "Sol-Attn (Triton)",
@@ -144,6 +146,15 @@ public class H3AttnExtension : Extension
             OrderPriority: order++
         ));
 
+        SolInt8Pv = T2IParamTypes.Register<bool>(new T2IParamType(
+            Name: "H3A Sol INT8 PV",
+            Description: "Also run the exact branch's P@V in INT8 (per-row P scale, per-channel V scale). PV and QK cost the same, so this is the other half of the INT8 win. Only applies when INT8 QK is on.",
+            Default: "true",
+            Group: SolGroup,
+            FeatureFlag: SolFeatureFlag,
+            OrderPriority: order++
+        ));
+
         SolSinkConditioning = T2IParamTypes.Register<string>(new T2IParamType(
             Name: "H3A Sol Sink Conditioning",
             Description: "exact_kv: every query sees the packed text/audio/reference rows exactly (~3% cost). exact_kv_and_rows: also runs those query rows dense, making the generated audio stream exact (~20% cost). off: no sink.",
@@ -174,9 +185,30 @@ public class H3AttnExtension : Extension
             OrderPriority: order++
         ));
 
+        SolDenseBlocks = T2IParamTypes.Register<string>(new T2IParamType(
+            Name: "H3A Sol Dense Blocks",
+            Description: "Transformer blocks to keep dense, e.g. '0-2,-1' for the first three and the last. Negative indices count from the end. The first and last blocks are the most approximation-sensitive — their error reaches the output with no later block to absorb it. Empty sparsifies every block. Use Block Probe to find which ones actually matter for your model.",
+            Default: "",
+            Examples: ["", "0,-1", "0-2,-1"],
+            IsAdvanced: true,
+            Group: SolGroup,
+            FeatureFlag: SolFeatureFlag,
+            OrderPriority: order++
+        ));
+
+        SolBlockProbe = T2IParamTypes.Register<bool>(new T2IParamType(
+            Name: "H3A Sol Block Probe",
+            Description: "Diagnostic. Runs every attention call both sparse and dense and logs each block's relative error, worst first, when sampling ends — paste the top entries into Dense Blocks. The generation itself is the dense reference, and it costs roughly dense + sparse, so turn this back off once you have the numbers.",
+            Default: "false",
+            IsAdvanced: true,
+            Group: SolGroup,
+            FeatureFlag: SolFeatureFlag,
+            OrderPriority: order++
+        ));
+
         SolUseTma = T2IParamTypes.Register<bool>(new T2IParamType(
             Name: "H3A Sol Use TMA",
-            Description: "Use the TMA descriptor kernels instead of the pointer ones. Needs contiguous block-padded q/k/v, so peak VRAM goes to ~4x a q/k/v tensor. Requires SM90+ and Triton 3.3+; has not measured faster on any tested GPU.",
+            Description: "Use the TMA descriptor kernels instead of the pointer ones. Descriptors address strided inputs directly, so peak VRAM now matches the pointer path. Requires SM90+ and Triton 3.3+; has not measured faster on any tested GPU.",
             Default: "false",
             IsAdvanced: true,
             Group: SolGroup,
@@ -328,6 +360,7 @@ public class H3AttnExtension : Extension
     {
         bool useSol = IsSubGroupEnabled(generator, SolTau);
         bool useSpectrum = IsSubGroupEnabled(generator, SpectrumBlendWeight);
+        bool useProbe = useSol && generator.UserInput.Get(SolBlockProbe, false);
         if (!useSol && !useSpectrum)
         {
             return;
@@ -346,6 +379,12 @@ public class H3AttnExtension : Extension
             if (useSol)
             {
                 headId = tailId = CreateSolAttnNode(generator);
+                if (useProbe)
+                {
+                    // The probe wraps whatever override is already installed, so it has to sit after the patch.
+                    JObject probeInputs = new() { ["model"] = new JArray(tailId, 0) };
+                    tailId = generator.CreateNode(SolProbeNodeName, (_, node) => node["inputs"] = probeInputs);
+                }
             }
             if (useSpectrum)
             {
@@ -358,7 +397,7 @@ public class H3AttnExtension : Extension
             generator.ReplaceNodeConnection(shiftOut, new JArray(tailId, 0));
             ((JObject)generator.Workflow[headId]["inputs"])["model"] = shiftOut;
         }
-        Logs.Debug($"H3 Attn: attached{(useSol ? " Sol-Attn" : "")}{(useSpectrum ? " Spectrum" : "")} to {shiftIds.Count} {SigmaShiftNodeName} node(s).");
+        Logs.Debug($"H3 Attn: attached{(useSol ? " Sol-Attn" : "")}{(useProbe ? " Block-Probe" : "")}{(useSpectrum ? " Spectrum" : "")} to {shiftIds.Count} {SigmaShiftNodeName} node(s).");
     }
 
     /// <summary>Creates the Sol-Attn patch node with no model wired yet (the caller connects it).</summary>
@@ -371,9 +410,11 @@ public class H3AttnExtension : Extension
             ["end_percent"] = generator.UserInput.Get(SolEndPercent, 0.9),
             ["min_tokens"] = generator.UserInput.Get(SolMinTokens, 4096),
             ["int8_qk"] = generator.UserInput.Get(SolInt8Qk, true),
+            ["int8_pv"] = generator.UserInput.Get(SolInt8Pv, true),
             ["sink_conditioning"] = generator.UserInput.Get(SolSinkConditioning, "exact_kv_and_rows"),
             ["morton"] = generator.UserInput.Get(SolMorton, false),
             ["morton_curve"] = generator.UserInput.Get(SolMortonCurve, "2d_frame"),
+            ["dense_blocks"] = generator.UserInput.Get(SolDenseBlocks, ""),
             ["verbose"] = generator.UserInput.Get(SolVerbose, false),
             ["use_tma"] = generator.UserInput.Get(SolUseTma, false)
         };
