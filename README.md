@@ -21,16 +21,18 @@ Every link is optional; whichever sub-groups are enabled get inserted, in that o
 
 One master group, **H3 Attention**, with a toggle. Inside it, one toggled sub-group per upstream extension:
 
-- **H3 Sol-Attn** — tau, start/end percent, min tokens, INT8 QK + PV, sink conditioning, Morton reorder + curve, dense blocks, block probe, TMA, verbose.
-- **H3 Spectrum** — blend weight, degree, ridge lambda, window size, flex window, warmup steps, tail actual steps, max history, history storage, debug.
+- **H3 Sol-Attn** — tau, start/end percent, min tokens, INT8 QK + PV, sink conditioning, Morton reorder + curve, dense blocks, tau profile, block probe, TMA, verbose.
+- **H3 Spectrum** — blend weight, degree, ridge lambda, window size, flex window, warmup steps, bootstrap first forecast, tail actual steps, max history, history storage, debug.
 
 A toggled group sends none of its parameters when its toggle (or the master's) is off, which is exactly how the extension decides whether to insert each node — no separate "enable" checkbox.
 
 Parameters are feature-flagged (`sol_attn_triton`, `spectrum_minimax_h3`), so they only appear once the matching custom nodes are installed. Until then each sub-group shows an install button.
 
-**Optimal @ 20 Steps** sets every Sol-Attn and Spectrum value to a preset tuned for 20 sampling steps (it does not touch your Steps parameter). Two values are left alone on purpose: Spectrum's History Storage, and Sol-Attn's Dense Blocks — which blocks are too sensitive to sparsify is per-model, and only a Block Probe run tells you.
+**Optimal @ 20 Steps** sets every Sol-Attn and Spectrum value to a preset tuned for 20 sampling steps (it does not touch your Steps parameter). Three values are left alone on purpose: Spectrum's History Storage, and Sol-Attn's Dense Blocks and Tau Profile — how sensitive each block is to sparsification is per-model, and only a Block Probe run tells you.
 
-**Dense Blocks / Block Probe.** Block Probe computes every attention call both sparse and dense, logs each block's relative error worst-first when sampling ends, and outputs the dense result — so that generation is a dense reference and costs roughly dense + sparse. Paste the worst blocks into Dense Blocks (`0-2,-1` style, negatives count from the end) and turn the probe back off.
+**Dense Blocks / Tau Profile / Block Probe.** Block Probe computes every attention call both sparse and dense, logs each block's relative error worst-first when sampling ends, and outputs the dense result — so that generation is a dense reference and costs roughly dense + sparse. Paste the worst blocks into Dense Blocks (`0-2,-1` style, negatives count from the end) and turn the probe back off. Tau Profile is the graded version of the same knob: `0-30=2.0; 39-42=0.9` sparsifies the insensitive blocks harder and eases off the fragile ones, instead of one tau serving both.
+
+**Bootstrap First Forecast.** Spectrum's one-point bootstrap holds step 0's transformer feature as step 1's prediction, so forecasting starts immediately rather than after a warmup long enough to fit a polynomial. Step 1 still runs its own timestep conditioning, final layer, projections and sigma-dependent audio processing — only the transformer body is skipped. It is defined only for Degree 1 and Warmup Steps ≤ 1; set anything else and the node keeps your degree and warmup and silently drops just the bootstrap, with a console line saying so. Upstream calls it experimental.
 
 ## Turbo LoRA converter
 
@@ -52,3 +54,4 @@ Drop `--curve` for a non-pruned base (`*_bf16`, `*_int8_convrot`). The outputs a
 - Sol-Attn needs Triton and is bf16 + head_dim 128 only; anything else falls back to the normal attention backend. The first run is slow while it autotunes.
 - Spectrum is an approximate accelerator. It changes the denoising trajectory, so output differs from a native run even at identical seed. Its README documents trajectory deviations and degraded fine detail during fast motion.
 - Spectrum requires ComfyUI at or after commit `e377e263` (Aug 3 2026) for the `latent_shapes` sampler API.
+- Bootstrap First Forecast needs Spectrum v0.1.7+ and Tau Profile needs Sol-Attn at or after `0e334dc` (Aug 6 2026). On older nodes ComfyUI ignores the unknown input rather than erroring, so the rest of the workflow still runs — you just do not get the feature.

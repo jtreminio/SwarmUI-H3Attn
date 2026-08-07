@@ -29,12 +29,12 @@ public class H3AttnExtension : Extension
     public static T2IRegisteredParam<double> SolTau, SolStartPercent, SolEndPercent;
     public static T2IRegisteredParam<int> SolMinTokens;
     public static T2IRegisteredParam<bool> SolInt8Qk, SolInt8Pv, SolMorton, SolUseTma, SolBlockProbe, SolVerbose;
-    public static T2IRegisteredParam<string> SolSinkConditioning, SolMortonCurve, SolDenseBlocks;
+    public static T2IRegisteredParam<string> SolSinkConditioning, SolMortonCurve, SolDenseBlocks, SolTauProfile;
 
     // Spectrum (gate: SpectrumBlendWeight).
     public static T2IRegisteredParam<double> SpectrumBlendWeight, SpectrumRidgeLambda, SpectrumWindowSize, SpectrumFlexWindow;
     public static T2IRegisteredParam<int> SpectrumDegree, SpectrumWarmupSteps, SpectrumTailActualSteps, SpectrumMaxHistory;
-    public static T2IRegisteredParam<bool> SpectrumDebug;
+    public static T2IRegisteredParam<bool> SpectrumDebug, SpectrumBootstrapFirstForecast;
     public static T2IRegisteredParam<string> SpectrumHistoryStorage;
 
     public override void OnInit()
@@ -196,6 +196,17 @@ public class H3AttnExtension : Extension
             OrderPriority: order++
         ));
 
+        SolTauProfile = T2IParamTypes.Register<string>(new T2IParamType(
+            Name: "H3A Sol Tau Profile",
+            Description: "Per-block tau, overriding the base Tau. 'blocks=tau' entries separated by ';' or newlines, e.g. '0-30=2.0; 39-42=0.9'. The block side takes Dense Blocks syntax, so '0-2,47=1.8' works and negatives count from the end; '#' starts a comment and later entries win where they overlap. Sensitivity varies several-fold across depth, so a single tau either over-serves the insensitive blocks or under-serves the fragile ones — Block Probe ranks them. Empty uses the base Tau everywhere.",
+            Default: "",
+            Examples: ["", "0-30=2.0; 39-42=0.9"],
+            IsAdvanced: true,
+            Group: SolGroup,
+            FeatureFlag: SolFeatureFlag,
+            OrderPriority: order++
+        ));
+
         SolBlockProbe = T2IParamTypes.Register<bool>(new T2IParamType(
             Name: "H3A Sol Block Probe",
             Description: "Diagnostic. Runs every attention call both sparse and dense and logs each block's relative error, worst first, when sampling ends — paste the top entries into Dense Blocks. The generation itself is the dense reference, and it costs roughly dense + sparse, so turn this back off once you have the numbers.",
@@ -242,8 +253,8 @@ public class H3AttnExtension : Extension
 
         SpectrumDegree = T2IParamTypes.Register<int>(new T2IParamType(
             Name: "H3A Spectrum Degree",
-            Description: "Chebyshev polynomial degree used to fit the feature history.",
-            Default: "4",
+            Description: "Chebyshev polynomial degree used to fit the feature history. Needs at least degree+1 actual points before any forecast. Anything other than 1 turns Bootstrap First Forecast off for the run.",
+            Default: "1",
             Min: 1, Max: 16, Step: 1,
             ViewMin: 1, ViewMax: 16,
             ViewType: ParamViewType.SLIDER,
@@ -292,11 +303,20 @@ public class H3AttnExtension : Extension
 
         SpectrumWarmupSteps = T2IParamTypes.Register<int>(new T2IParamType(
             Name: "H3A Spectrum Warmup Steps",
-            Description: "Leading steps that always run the real transformer, to build feature history before any forecasting.",
-            Default: "5",
+            Description: "Leading steps that always run the real transformer, to build feature history before any forecasting. Above 1 turns Bootstrap First Forecast off for the run.",
+            Default: "1",
             Min: 0, Max: 64, Step: 1,
             ViewMin: 0, ViewMax: 64,
             ViewType: ParamViewType.SLIDER,
+            Group: SpectrumGroup,
+            FeatureFlag: SpectrumFeatureFlag,
+            OrderPriority: order++
+        ));
+
+        SpectrumBootstrapFirstForecast = T2IParamTypes.Register<bool>(new T2IParamType(
+            Name: "H3A Spectrum Bootstrap First Forecast",
+            Description: "Forecast solver step 1 by holding step 0's transformer feature, instead of waiting for enough history to fit. Step 1 still runs its own timestep conditioning, final layer, projections and sigma-dependent audio processing — only the transformer body is skipped. Needs Degree 1 and Warmup Steps at most 1; with anything else the node turns it off for that run and logs why. Experimental, and it does change the trajectory.",
+            Default: "true",
             Group: SpectrumGroup,
             FeatureFlag: SpectrumFeatureFlag,
             OrderPriority: order++
@@ -418,6 +438,13 @@ public class H3AttnExtension : Extension
             ["verbose"] = generator.UserInput.Get(SolVerbose, false),
             ["use_tma"] = generator.UserInput.Get(SolUseTma, false)
         };
+        // tau_profile is declared force_input upstream, so it has no widget default to fall back on.
+        // Only send it when there is something to say.
+        string tauProfile = generator.UserInput.Get(SolTauProfile, "");
+        if (!string.IsNullOrWhiteSpace(tauProfile))
+        {
+            inputs["tau_profile"] = tauProfile;
+        }
         // The configure-action overload of CreateNode skips the input-hash dedupe cache, so two
         // sigma-shift nodes each get their own patch node instead of collapsing into one.
         return generator.CreateNode(SolNodeName, (_, node) => node["inputs"] = inputs);
@@ -429,11 +456,12 @@ public class H3AttnExtension : Extension
         {
             ["enabled"] = true,
             ["blend_weight"] = generator.UserInput.Get(SpectrumBlendWeight, 0.5),
-            ["degree"] = generator.UserInput.Get(SpectrumDegree, 4),
+            ["degree"] = generator.UserInput.Get(SpectrumDegree, 1),
             ["ridge_lambda"] = generator.UserInput.Get(SpectrumRidgeLambda, 0.1),
             ["window_size"] = generator.UserInput.Get(SpectrumWindowSize, 2.0),
             ["flex_window"] = generator.UserInput.Get(SpectrumFlexWindow, 0.75),
-            ["warmup_steps"] = generator.UserInput.Get(SpectrumWarmupSteps, 5),
+            ["warmup_steps"] = generator.UserInput.Get(SpectrumWarmupSteps, 1),
+            ["bootstrap_first_forecast"] = generator.UserInput.Get(SpectrumBootstrapFirstForecast, true),
             ["tail_actual_steps"] = generator.UserInput.Get(SpectrumTailActualSteps, 1),
             ["max_history"] = generator.UserInput.Get(SpectrumMaxHistory, 8),
             ["debug"] = generator.UserInput.Get(SpectrumDebug, false),

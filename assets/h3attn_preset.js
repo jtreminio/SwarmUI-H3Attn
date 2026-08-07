@@ -1,6 +1,12 @@
 /** Tuned for 20 sampling steps. Keeps Spectrum's longest run of consecutive forecast
  * steps at 2 — 3-in-a-row is the edge, and 4-5 (what Flex Window 0.75 reaches by 30
- * steps) audibly breaks the generated audio stream. */
+ * steps) audibly breaks the generated audio stream.
+ *
+ * Spectrum's one-point bootstrap (v0.1.7+) is on, which is why Degree is 1 and Warmup
+ * Steps is 1 — the bootstrap only exists for that pair, and the node disables it with a
+ * console warning under any other. It buys the two forecasts that a degree-4 fit had to
+ * spend warming up: a 20-step run goes A F A F ... A A, 9 forecast steps against the 7
+ * the old degree-4 / warmup-5 preset reached, with no back-to-back forecasts either way. */
 const H3A_OPTIMAL_20 = {
     'H3A Sol Tau': 1.5,
     'H3A Sol Start Percent': 0.2,
@@ -11,17 +17,19 @@ const H3A_OPTIMAL_20 = {
     'H3A Sol Sink Conditioning': 'exact_kv_and_rows',
     'H3A Sol Morton': true,
     'H3A Sol Morton Curve': '2d_frame',
-    // Dense Blocks is deliberately absent — which blocks need to stay dense is per-model,
-    // and the only way to know is a Block Probe run. The preset leaves yours alone.
+    // Dense Blocks and Tau Profile are deliberately absent — which blocks need to stay
+    // dense, and which can take a higher tau, is per-model, and the only way to know is a
+    // Block Probe run. The preset leaves yours alone.
     'H3A Sol Block Probe': false,
     'H3A Sol Use TMA': false,
     'H3A Sol Verbose': false,
     'H3A Spectrum Blend Weight': 0.5,
-    'H3A Spectrum Degree': 4,
+    'H3A Spectrum Degree': 1,
     'H3A Spectrum Ridge Lambda': 0.1,
     'H3A Spectrum Window Size': 2.0,
     'H3A Spectrum Flex Window': 0.25,
-    'H3A Spectrum Warmup Steps': 5,
+    'H3A Spectrum Warmup Steps': 1,
+    'H3A Spectrum Bootstrap First Forecast': true,
     'H3A Spectrum Tail Actual Steps': 2,
     'H3A Spectrum Max History': 8,
     // History Storage is deliberately absent — the preset leaves whatever you have set.
