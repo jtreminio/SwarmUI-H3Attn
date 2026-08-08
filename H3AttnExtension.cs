@@ -1,4 +1,5 @@
 using Newtonsoft.Json.Linq;
+using System.IO;
 using SwarmUI.Builtin_ComfyUIBackend;
 using SwarmUI.Core;
 using SwarmUI.Text2Image;
@@ -6,7 +7,7 @@ using SwarmUI.Utils;
 
 namespace H3Attn;
 
-/// <summary>Attaches the Sol-Attn and Spectrum MiniMax H3 accelerator nodes onto every
+/// <summary>Attaches MiniMax H3 attention and sampling accelerators onto every
 /// <c>MiniMaxH3SigmaShift</c> node in the generated workflow.</summary>
 public class H3AttnExtension : Extension
 {
@@ -23,7 +24,18 @@ public class H3AttnExtension : Extension
     /// <summary>Runs after every core workflow step (the last core step is priority 200).</summary>
     public const double StepPriority = 1000;
 
-    public static T2IParamGroup H3AttnGroup, SolGroup, SpectrumGroup;
+    /// <summary>Comfy feature advertised by the extension-owned window-attention node.</summary>
+    public const string WindowFeatureFlag = "h3_window_attention";
+
+    /// <summary>Extension-owned Comfy node that patches MiniMax H3 attention.</summary>
+    public const string WindowNodeName = "H3WindowAttentionPatch";
+
+    public static T2IParamGroup H3AttnGroup, WindowGroup, SolGroup, SpectrumGroup;
+
+    // Local-window attention (gate: WindowSeconds — see IsSubGroupEnabled).
+    public static T2IRegisteredParam<double> WindowSeconds;
+    public static T2IRegisteredParam<string> WindowDenseLayers;
+    public static T2IRegisteredParam<bool> WindowVerbose;
 
     // Sol-Attn (gate: SolTau — see IsSubGroupEnabled).
     public static T2IRegisteredParam<double> SolTau, SolStartPercent, SolEndPercent;
@@ -40,6 +52,8 @@ public class H3AttnExtension : Extension
     public override void OnInit()
     {
         Logs.Info("SwarmUI H3 Attn Extension initializing...");
+        RegisterComfyNodes();
+        ComfyUIBackendExtension.NodeToFeatureMap[WindowNodeName] = WindowFeatureFlag;
         ComfyUIBackendExtension.NodeToFeatureMap[SolNodeName] = SolFeatureFlag;
         ComfyUIBackendExtension.NodeToFeatureMap[SolProbeNodeName] = SolFeatureFlag;
         ComfyUIBackendExtension.NodeToFeatureMap[SpectrumNodeName] = SpectrumFeatureFlag;
@@ -65,7 +79,17 @@ public class H3AttnExtension : Extension
             Open: false,
             IsAdvanced: false,
             OrderPriority: 9,
-            Description: "MiniMax H3 sampling accelerators. Attached to every MiniMaxH3SigmaShift node in the workflow, in order: Sol-Attn, then Spectrum."
+            Description: "MiniMax H3 sampling accelerators. Window Attention is the local T2VA/FL2VA prototype; Sol-Attn and Spectrum are separate optional accelerators."
+        );
+
+        WindowGroup = new T2IParamGroup(
+            Name: "H3 Window Attention",
+            Toggles: true,
+            Open: false,
+            IsAdvanced: false,
+            OrderPriority: 0,
+            Parent: H3AttnGroup,
+            Description: "Experimental T2VA/FL2VA-only rolling window. Prompt, audio, and first/last keyframes stay global; video uses a centered temporal window with selected dense layers."
         );
 
         SolGroup = new T2IParamGroup(
@@ -89,6 +113,40 @@ public class H3AttnExtension : Extension
         );
 
         int order = 0;
+
+        WindowSeconds = T2IParamTypes.Register<double>(new T2IParamType(
+            Name: "H3A Window Seconds",
+            Description: "Total centered temporal window. Five seconds gives roughly 2.5 seconds before and after each video frame.",
+            Default: "5.0",
+            Min: 1, Max: 20, Step: 0.5,
+            ViewMin: 1, ViewMax: 20,
+            ViewType: ParamViewType.SLIDER,
+            Group: WindowGroup,
+            FeatureFlag: WindowFeatureFlag,
+            OrderPriority: order++
+        ));
+
+        WindowDenseLayers = T2IParamTypes.Register<string>(new T2IParamType(
+            Name: "H3A Window Dense Layers",
+            Description: "Comma-separated transformer layers that keep full global attention. Negative indices count from the end.",
+            Default: "0,9,19,29,39,49",
+            Examples: ["0,9,19,29,39,49", "0,12,24,36,49", "0,-1"],
+            Group: WindowGroup,
+            FeatureFlag: WindowFeatureFlag,
+            OrderPriority: order++
+        ));
+
+        WindowVerbose = T2IParamTypes.Register<bool>(new T2IParamType(
+            Name: "H3A Window Verbose",
+            Description: "Log the resolved H3 token layout and window configuration once per shape.",
+            Default: "false",
+            Group: WindowGroup,
+            FeatureFlag: WindowFeatureFlag,
+            IsAdvanced: true,
+            OrderPriority: order++
+        ));
+
+        order = 0;
 
         SolTau = T2IParamTypes.Register<double>(new T2IParamType(
             Name: "H3A Sol Tau",
@@ -378,10 +436,11 @@ public class H3AttnExtension : Extension
 
     private static void ApplyH3Attn(WorkflowGenerator generator)
     {
+        bool useWindow = IsSubGroupEnabled(generator, WindowSeconds);
         bool useSol = IsSubGroupEnabled(generator, SolTau);
         bool useSpectrum = IsSubGroupEnabled(generator, SpectrumBlendWeight);
         bool useProbe = useSol && generator.UserInput.Get(SolBlockProbe, false);
-        if (!useSol && !useSpectrum)
+        if (!useWindow && !useSol && !useSpectrum)
         {
             return;
         }
@@ -406,6 +465,11 @@ public class H3AttnExtension : Extension
                     tailId = generator.CreateNode(SolProbeNodeName, (_, node) => node["inputs"] = probeInputs);
                 }
             }
+            if (useWindow)
+            {
+                tailId = CreateWindowNode(generator, tailId is null ? null : new JArray(tailId, 0));
+                headId ??= tailId;
+            }
             if (useSpectrum)
             {
                 tailId = CreateSpectrumNode(generator, tailId is null ? null : new JArray(tailId, 0));
@@ -417,7 +481,23 @@ public class H3AttnExtension : Extension
             generator.ReplaceNodeConnection(shiftOut, new JArray(tailId, 0));
             ((JObject)generator.Workflow[headId]["inputs"])["model"] = shiftOut;
         }
-        Logs.Debug($"H3 Attn: attached{(useSol ? " Sol-Attn" : "")}{(useProbe ? " Block-Probe" : "")}{(useSpectrum ? " Spectrum" : "")} to {shiftIds.Count} {SigmaShiftNodeName} node(s).");
+        Logs.Debug($"H3 Attn: attached{(useWindow ? " Window-Attention" : "")}{(useSol ? " Sol-Attn" : "")}{(useProbe ? " Block-Probe" : "")}{(useSpectrum ? " Spectrum" : "")} to {shiftIds.Count} {SigmaShiftNodeName} node(s).");
+    }
+
+    /// <summary>Creates the local T2VA/FL2VA window-attention patch node.</summary>
+    private static string CreateWindowNode(WorkflowGenerator generator, JArray model)
+    {
+        JObject inputs = new()
+        {
+            ["window_seconds"] = generator.UserInput.Get(WindowSeconds, 5.0),
+            ["dense_layers"] = generator.UserInput.Get(WindowDenseLayers, "0,9,19,29,39,49"),
+            ["verbose"] = generator.UserInput.Get(WindowVerbose, false)
+        };
+        if (model is not null)
+        {
+            inputs["model"] = model;
+        }
+        return generator.CreateNode(WindowNodeName, (_, node) => node["inputs"] = inputs);
     }
 
     /// <summary>Creates the Sol-Attn patch node with no model wired yet (the caller connects it).</summary>
@@ -472,5 +552,14 @@ public class H3AttnExtension : Extension
             inputs["model"] = model;
         }
         return generator.CreateNode(SpectrumNodeName, (_, node) => node["inputs"] = inputs);
+    }
+
+    /// <summary>Registers the extension-owned ComfyUI nodes before the self-start backend launches.</summary>
+    private void RegisterComfyNodes()
+    {
+        string rootPath = string.IsNullOrWhiteSpace(FilePath) ? "src/Extensions/SwarmUI-H3Attn" : FilePath;
+        string nodeFolder = Path.GetFullPath(Path.Join(rootPath, "comfy_node"));
+        ComfyUISelfStartBackend.CustomNodePaths.Add(nodeFolder);
+        Logs.Init($"H3Attn: added {nodeFolder} to ComfyUI CustomNodePaths");
     }
 }

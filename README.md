@@ -1,6 +1,8 @@
 # SwarmUI-H3Attn
 
-Wires two third-party MiniMax H3 accelerator nodes into SwarmUI's generated workflows:
+Adds an extension-owned MiniMax H3 window-attention prototype and wires two optional third-party accelerator nodes into SwarmUI's generated workflows:
+
+- **H3 Window Attention** — T2VA/FL2VA-only compiled block-sparse attention. Prompt, generated audio, and first/last keyframes stay global; video tokens use a centered temporal window, with configurable dense transformer layers for long-range communication.
 
 - [ComfyUI-SolAttn_triton](https://github.com/kijai/ComfyUI-SolAttn_triton) by kijai — sparse self-attention (Sol-Attn, arXiv 2607.24027) on a Triton kernel.
 - [ComfyUI-Spectrum-MiniMax-H3](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3) by xmarre — Chebyshev-ridge spectral forecasting of post-transformer features, letting some solver steps skip the transformer entirely.
@@ -12,21 +14,22 @@ Both target the same problem: H3 packs ~37k tokens for a 5s clip at 832x1216 and
 It runs as the last workflow-generation step (priority 1000, after the last core step at 200), finds **every** `MiniMaxH3SigmaShift` node in the workflow, and splices a chain in behind it:
 
 ```
-MiniMaxH3SigmaShift -> SolAttnPatch -> [SolAttnBlockProbe] -> SpectrumApplyMiniMaxH3 -> (whatever used to consume the sigma shift)
+MiniMaxH3SigmaShift -> SolAttnPatch -> [SolAttnBlockProbe] -> H3WindowAttentionPatch -> SpectrumApplyMiniMaxH3 -> (consumer)
 ```
 
-Every link is optional; whichever sub-groups are enabled get inserted, in that order. The probe only appears when Sol-Attn is on, since it exists to measure Sol-Attn's own override.
+Every link is optional. The local window patch is inserted after Sol-Attn when both are enabled, so it owns eligible H3 attention calls and chains unsupported calls to the prior backend. The probe only appears when Sol-Attn is on, since it exists to measure Sol-Attn's own override.
 
 ## UI
 
-One master group, **H3 Attention**, with a toggle. Inside it, one toggled sub-group per upstream extension:
+One master group, **H3 Attention**, with a toggle. Inside it are independently toggled accelerator groups:
 
+- **H3 Window Attention** — total centered window in seconds, dense transformer layers, and verbose layout diagnostics. It falls back to dense attention for clips no longer than the window and for reference-video layouts.
 - **H3 Sol-Attn** — tau, start/end percent, min tokens, INT8 QK + PV, sink conditioning, Morton reorder + curve, dense blocks, tau profile, block probe, TMA, verbose.
 - **H3 Spectrum** — blend weight, degree, ridge lambda, window size, flex window, warmup steps, bootstrap first forecast, tail actual steps, max history, history storage, debug.
 
 A toggled group sends none of its parameters when its toggle (or the master's) is off, which is exactly how the extension decides whether to insert each node — no separate "enable" checkbox.
 
-Parameters are feature-flagged (`sol_attn_triton`, `spectrum_minimax_h3`), so they only appear once the matching custom nodes are installed. Until then each sub-group shows an install button.
+Parameters are feature-flagged (`h3_window_attention`, `sol_attn_triton`, `spectrum_minimax_h3`), so they only appear once the matching custom nodes are available. Window Attention ships with this extension; the third-party groups show an install button until installed.
 
 **Optimal @ 20 Steps** sets every Sol-Attn and Spectrum value to a preset tuned for 20 sampling steps (it does not touch your Steps parameter). Three values are left alone on purpose: Spectrum's History Storage, and Sol-Attn's Dense Blocks and Tau Profile — how sensitive each block is to sparsification is per-model, and only a Block Probe run tells you.
 
@@ -51,6 +54,10 @@ Drop `--curve` for a non-pruned base (`*_bf16`, `*_int8_convrot`). The outputs a
 
 ## Notes
 
+- Window Attention requires PyTorch FlexAttention. Its first generation at a new shape builds compact block metadata and compiles a specialized Triton attention kernel. Interior allowed blocks are marked fully valid, so only temporal edges and packed-layout boundaries evaluate the token mask. Partial and full index rows intentionally share one padded width because the current generated kernel uses a shared row stride for both. Any unsupported layout or kernel failure is logged and falls back to the existing dense attention backend.
+- On windowed layers, the configured ComfyUI backend (SageAttention when enabled) computes prompt, audio, and keyframe query rows against the full sequence; FlexAttention computes only target-video query rows.
+- H3's QKV tensors use a very large inherited token stride. The patch compacts video Q and full K/V before FlexAttention so Triton's address calculation remains valid beyond the midpoint of a 20-second clip. This adds two full-sequence copies and one video-only copy per windowed layer.
+- Window Attention is intentionally limited to T2VA/FL2VA. Reference-video layouts remain dense until they have a timestamp-aware policy.
 - Sol-Attn needs Triton and is bf16 + head_dim 128 only; anything else falls back to the normal attention backend. The first run is slow while it autotunes.
 - Spectrum is an approximate accelerator. It changes the denoising trajectory, so output differs from a native run even at identical seed. Its README documents trajectory deviations and degraded fine detail during fast motion.
 - Spectrum requires ComfyUI at or after commit `e377e263` (Aug 3 2026) for the `latent_shapes` sampler API.
